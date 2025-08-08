@@ -1,0 +1,240 @@
+import numpy as np
+import math
+import random
+from typing import List, Tuple, Dict
+
+# Constants
+NUM_NODES = 50  # Number of nodes in WBAN
+E_MIN, E_MAX = 0.05, 0.15  # Initial energy range (J)
+H_MIN, H_MAX = 20e-6, 50e-6  # Harvesting rate range (W)
+D_MAX = 1.0  # Max distance in WBAN (m)
+E_ELEC = 50e-9  # Electronics energy per bit (J/bit)
+EPS_AMP = 100e-12  # Amplifier energy (J/bit/m^2)
+K_B = 200  # Beacon packet size (bits)
+GAMMA = 0.01  # Coherence decay (m^-1)
+W_V, C1, C2, C3, C4 = 0.8, 1.0, 0.5, 0.5, 0.2  # Flocking weights
+T_THRESH = 0.5  # Initial trust threshold
+R_0 = 0.5  # Initial communication range (m)
+KAPPA = 0.01  # Range decay constant
+ETA = 0.05  # Harvesting efficiency
+K_H = 1e-6  # Thermal constant
+A_I = 1e-4  # Node surface area (m^2)
+DELTA_T = 0.5  # Temperature gradient (°C)
+T_CYCLE = 1.0  # Bio-cycle period (s)
+E_CAP = 0.36  # Battery capacity (J)
+
+class Node:
+    def __init__(self, id: int, x: float, y: float, energy: float, trust: float, harvest_rate: float):
+        self.id = id
+        self.pos = np.array([x, y])
+        self.energy = energy
+        self.trust = trust
+        self.harvest_rate = harvest_rate
+        self.is_ch = False
+        self.velocity = np.array([0.0, 0.0])
+        self.personal_best = self.pos
+        self.success = 0
+        self.failure = 0
+        self.data = 0.0
+
+class QuanBioTrust:
+    def __init__(self, num_nodes: int):
+        self.nodes = []
+        self.sink_pos = np.array([0.0, 0.0])
+        self.clusters = {}
+        self.time = 0.0
+        self.initialize_network(num_nodes)
+
+    def initialize_network(self, num_nodes: int) -> None:
+        """Step 1: Network Initialization"""
+        for i in range(num_nodes):
+            x = np.random.normal(0, 0.2)
+            y = np.random.normal(0, 0.2)
+            energy = np.random.uniform(E_MIN, E_MAX)
+            trust = 1.0
+            harvest_rate = ETA * K_H * A_I * DELTA_T
+            node = Node(i, x, y, energy, trust, harvest_rate)
+            d_to_sink = np.sqrt(np.sum((node.pos - self.sink_pos) ** 2))
+            node.q_coherence = math.exp(-GAMMA * d_to_sink)
+            alpha = math.sqrt((energy / E_MAX) * (D_MAX - d_to_sink) / D_MAX)
+            node.alpha_sq = alpha ** 2
+            node.beta_sq = 1 - node.alpha_sq
+            self.nodes.append(node)
+            e_beacon = E_ELEC * K_B + EPS_AMP * K_B * d_to_sink ** 2
+            node.energy -= e_beacon
+
+    def quantum_clustering(self) -> None:
+        """Step 2: Quantum-Enhanced Clustering with QPSO"""
+        for node in self.nodes:
+            d_to_sink = np.sqrt(np.sum((node.pos - self.sink_pos) ** 2))
+            neighbors = [n for n in self.nodes if np.sqrt(np.sum((node.pos - n.pos) ** 2)) < R_0 * math.exp(-KAPPA * self.time)]
+            connectivity = len(neighbors)
+            delta_e = node.energy / E_MAX  # Simplified depletion rate
+            fitness = (0.4 * node.energy / E_MAX - 0.2 * d_to_sink / D_MAX +
+                       0.2 * connectivity / NUM_NODES + 0.15 * node.trust - 0.05 * delta_e)
+            node.alpha_sq = fitness / max([n.energy / E_MAX for n in self.nodes])
+            node.beta_sq = 1 - node.alpha_sq
+
+            # QPSO position update
+            mbest = np.mean([n.personal_best for n in neighbors], axis=0)
+            beta_t = 1.0 - self.time / 10000
+            u = random.uniform(0, 1)
+            node.pos += beta_t * abs(mbest - node.pos) * math.log(1 / u) * node.q_coherence
+
+            # Flocking-based velocity update
+            ch_pos = np.mean([n.pos for n in self.nodes if n.is_ch], axis=0) if any(n.is_ch for n in self.nodes) else node.pos
+            global_centroid = np.mean([n.pos for n in self.nodes], axis=0)
+            neighbor_vel_avg = np.mean([n.velocity for n in neighbors], axis=0) if neighbors else np.array([0.0, 0.0])
+            separation = sum((node.pos - n.pos) / (np.sum((node.pos - n.pos) ** 2) + 1e-6) for n in neighbors)
+            node.velocity = (W_V * node.velocity +
+                             C1 * random.random() * (ch_pos - node.pos) +
+                             C2 * random.random() * (global_centroid - node.pos) +
+                             C3 * random.random() * neighbor_vel_avg -
+                             C4 * random.random() * separation)
+            node.pos += node.velocity * 0.1
+
+            # CH selection
+            if node.alpha_sq > 0.7 * math.exp(-sum(n.energy for n in self.nodes) / (NUM_NODES * E_MAX)):
+                node.is_ch = True
+                self.clusters[node.id] = []
+            else:
+                node.is_ch = False
+
+        # Assign nodes to clusters
+        for node in self.nodes:
+            if not node.is_ch:
+                closest_ch = min([n for n in self.nodes if n.is_ch],
+                                 key=lambda n: np.sqrt(np.sum((node.pos - n.pos) ** 2)), default=None)
+                if closest_ch and np.sqrt(np.sum((node.pos - closest_ch.pos) ** 2)) < R_0 * math.exp(-KAPPA * self.time):
+                    self.clusters[closest_ch.id].append(node)
+
+    def trust_ecosystem(self) -> None:
+        """Step 3: Trust Ecosystem Establishment"""
+        for node in self.nodes:
+            # Direct Trust (DT)
+            pdr = node.success / (node.success + node.failure + 1e-6)
+            node.trust = pdr / (pdr + (1 - pdr) + 1e-6)
+
+            # Indirect Trust (IT)
+            neighbors = [n for n in self.nodes if np.sqrt(np.sum((node.pos - n.pos) ** 2)) < R_0 * math.exp(-KAPPA * self.time)]
+            it_sum = 0
+            weight_sum = 0
+            for neighbor in neighbors:
+                d_ij = np.sqrt(np.sum((node.pos - neighbor.pos) ** 2))
+                w_ij = math.exp(-d_ij / (R_0 * math.exp(-KAPPA * self.time))) * neighbor.q_coherence
+                it_sum += w_ij * neighbor.trust
+                weight_sum += w_ij
+            node.it = it_sum / (weight_sum + 1e-6) if weight_sum > 0 else node.trust
+
+            # Total Trust
+            alpha_t = math.exp(0.1 * node.trust) / (math.exp(0.1 * node.trust) + math.exp(0.1 * node.it))
+            node.trust = alpha_t * node.trust + (1 - alpha_t) * node.it
+
+            # Predator-Prey Isolation
+            mean_trust = np.mean([n.trust for n in self.nodes])
+            std_trust = np.std([n.trust for n in self.nodes])
+            t_thresh = mean_trust - 0.5 * std_trust * math.exp(-sum(n.energy for n in self.nodes) / (NUM_NODES * E_MAX))
+            if node.trust < t_thresh:
+                node.is_ch = False
+                if node.id in self.clusters:
+                    del self.clusters[node.id]
+
+    def intra_cluster_collection(self) -> None:
+        """Step 4: Intra-Cluster Data Collection"""
+        for ch_id, members in self.clusters.items():
+            ch = next(n for n in self.nodes if n.id == ch_id)
+            # Slime Mold Fusion
+            fused_data = 0
+            weight_sum = 0
+            for member in members + [ch]:
+                d_to_ch = np.sqrt(np.sum((member.pos - ch.pos) ** 2))
+                w_i = member.energy / E_MAX * member.trust
+                rho_i = 0.8  # Simplified correlation
+                fused_data += w_i * (1 - rho_i) * member.data
+                weight_sum += w_i * (1 - rho_i)
+            fused_data /= weight_sum + 1e-6
+            k_fused = K_B * (1 - 0.8 / (len(members) + 1))
+            ch.data = fused_data
+
+            # Quantum Compression (simplified)
+            k_quantum = k_fused / math.ceil(math.log2(32)) * (1 + 0.1)
+            e_quant = 1e-9 * k_quantum
+            ch.energy -= e_quant
+
+            # Transmission Energy
+            d_to_ch = np.sqrt(np.sum((ch.pos - self.sink_pos) ** 2))
+            alpha_t = 2 + 2 * d_to_ch / D_MAX
+            e_tx = E_ELEC * k_quantum + EPS_AMP * k_quantum * d_to_ch ** alpha_t
+            ch.energy -= e_tx
+
+    def swarm_routing(self) -> None:
+        """Step 5: Swarm-Driven Multi-Hop Routing"""
+        ch_nodes = [n for n in self.nodes if n.is_ch]
+        # Firefly Synchronization (simplified)
+        for node in ch_nodes:
+            phase = random.uniform(0, 2 * math.pi)
+            neighbors = [n for n in ch_nodes if np.sqrt(np.sum((node.pos - n.pos) ** 2)) < R_0]
+            for neighbor in neighbors:
+                phase += 0.1 * (neighbor.energy * neighbor.trust / (np.sum((node.pos - neighbor.pos) ** 2) + 1e-6)) * math.sin(phase - random.uniform(0, 2 * math.pi))
+
+        # Path Selection
+        for node in ch_nodes:
+            d_to_sink = np.sqrt(np.sum((node.pos - self.sink_pos) ** 2))
+            score = (0.4 * node.energy / E_MAX + 0.3 * node.trust - 0.2 * d_to_sink / D_MAX - 0.1 * 0.05)
+            next_hop = max(ch_nodes, key=lambda n: 0.4 * n.energy / E_MAX + 0.3 * n.trust - 0.2 * np.sqrt(np.sum((n.pos - self.sink_pos) ** 2)) / D_MAX, default=None)
+            if next_hop:
+                k_quantum = K_B / math.ceil(math.log2(32)) * (1 + 0.1)
+                d_to_next = np.sqrt(np.sum((node.pos - next_hop.pos) ** 2))
+                e_hop = E_ELEC * k_quantum + EPS_AMP * k_quantum * d_to_next ** (2 + 2 * d_to_next / D_MAX)
+                node.energy -= e_hop
+
+    def bio_energy_harvesting(self) -> None:
+        """Step 6: Bio-Energy Harvesting Integration"""
+        for node in self.nodes:
+            p_bio = K_H * A_I * DELTA_T * (1 + math.sin(2 * math.pi * self.time / T_CYCLE))
+            eta_t = ETA * (1 - math.exp(-node.energy / E_CAP))
+            node.harvest_rate = eta_t * p_bio + np.random.normal(0, 1e-7)
+            node.energy += node.harvest_rate * 0.1 * (1 - node.energy / E_CAP)
+            node.energy = max(0, min(node.energy, E_CAP))
+
+    def self_evolution(self) -> None:
+        """Step 7: Self-Evolution and Maintenance"""
+        # Energy Entropy Trigger
+        energies = [n.energy for n in self.nodes]
+        p_i = [e / sum(energies) for e in energies]
+        h_e = -sum(p * math.log2(p + 1e-6) for p in p_i)
+        e_avg = np.mean(energies)
+        e_std = np.std(energies)
+        e_th = 0.1 * E_MAX / NUM_NODES * (1 - math.exp(-e_std / E_MAX))
+        if h_e > e_th:
+            self.initialize_network(NUM_NODES)  # Re-cluster
+            return
+
+        # Trust Threshold Update
+        mean_trust = np.mean([n.trust for n in self.nodes])
+        std_trust = np.std([n.trust for n in self.nodes])
+        lambda_t = 0.1 * math.exp(-e_avg / E_MAX)
+        t_th_ss = 0.5 - (lambda_t * std_trust) / 0.01
+        for node in self.nodes:
+            if node.trust < t_th_ss:
+                node.is_ch = False
+                if node.id in self.clusters:
+                    del self.clusters[node.id]
+
+    def run_round(self) -> None:
+        """Run one round of QuanBioTrust"""
+        self.quantum_clustering()
+        self.trust_ecosystem()
+        self.intra_cluster_collection()
+        self.swarm_routing()
+        self.bio_energy_harvesting()
+        self.self_evolution()
+        self.time += 0.1
+
+# Example Usage
+if __name__ == "__main__":
+    wban = QuanBioTrust(NUM_NODES)
+    for _ in range(10000):  # 10,000 rounds
+        wban.run_round()
+        print(f"Round {_ + 1}: Avg Energy = {np.mean([n.energy for n in wban.nodes]):.4f} J, "
+              f"Avg Trust = {np.mean([n.trust for n in wban.nodes]):.4f}")
